@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,9 +10,6 @@ from tqdm import tqdm, trange
 from layers import Summarizer, Discriminator
 from utils import TensorboardWriter
 
-# labels for training the GAN part of the model
-original_label = torch.tensor(1.0).cuda()
-summary_label = torch.tensor(0.0).cuda()
 
 class Solver(object):
     def __init__(self, config=None, train_loader=None, test_loader=None):
@@ -53,37 +51,39 @@ class Solver(object):
                 + list(self.linear_compress.parameters()),
                 lr=self.config.discriminator_lr)
 
+            self.model.train()
+
             self.writer = TensorboardWriter(str(self.config.log_dir))
 
-    def reconstruction_loss(self, h_origin, h_sum):
+    def reconstruction_loss(self, hidden_gen, hidden_orig):
         """L2 loss between original-regenerated features at cLSTM's last hidden layer"""
-
-        return torch.norm(h_origin - h_sum, p=2)
+        return torch.norm(hidden_orig - hidden_gen, p=2)
 
     def sparsity_loss(self, scores):
         """Summary-Length Regularization"""
-
         return torch.abs(torch.mean(scores) - self.config.regularization_factor)
 
-    criterion = nn.MSELoss()
+    def prior_loss(self, mu, log_var):
+        ## for the VAE, KL divergence
+        ## taking the exp of the log_var to get the variance back
+        return 0.5 * torch.sum(-1 + log_var.exp() + mu.pow(2) - log_var)
+
+    def gan_loss(self, original_prob, generated_prob, uniform_prob):
+        ## taking formula directly from the paper
+        return torch.log(original_prob) + torch.log(1 - generated_prob) + torch.log(1 - uniform_prob)
 
     def train(self):
         step = 0
         for epoch_i in trange(self.config.n_epochs, desc='Epoch', ncols=80):
             s_e_loss_history = []
             d_loss_history = []
-            c_original_loss_history = []
-            c_summary_loss_history = []
+            c_loss_history = []
             for batch_i, image_features in enumerate(tqdm(
                     self.train_loader, desc='Batch', ncols=80, leave=False)):
 
                 self.model.train()
 
-                # [batch_size=1, seq_len, 1024]
-                # [seq_len, 1024]
                 image_features = image_features.view(-1, self.config.input_size)
-
-                # [seq_len, 1024]
                 image_features_ = Variable(image_features).cuda()
 
                 #---- Train sLSTM, eLSTM ----#
@@ -92,20 +92,23 @@ class Solver(object):
 
                 # [seq_len, 1, hidden_size]
                 original_features = self.linear_compress(image_features_.detach()).unsqueeze(1)
+                scores, h_mu, h_log_var, generated_features = self.summarizer(original_features)
+                _, _, _, uniform_features = self.summarizer(original_features, uniform=True)
 
-                scores, generated_features = self.summarizer(original_features)
-
+                ## Using the discriminator
                 h_origin, original_prob = self.discriminator(original_features)
-                h_sum, sum_prob = self.discriminator(generated_features)
+                h_fake, fake_prob = self.discriminator(generated_features)
+                h_uniform, uniform_prob = self.discriminator(uniform_features)
+                tqdm.write(
+                    f'orig_prob: {original_prob.item():.3f}, summ_prob: {fake_prob.item():.3f}, unif_prob: {uniform_prob.item():.3f}')
 
-                tqdm.write(f'original_p: {original_prob.item():.3f}, summary_p: {sum_prob.item():.3f}')
-
-                reconstruction_loss = self.reconstruction_loss(h_origin, h_sum)
+                reconstruction_loss = self.reconstruction_loss(h_fake, h_origin)
                 sparsity_loss = self.sparsity_loss(scores)
+                prior_loss = self.prior_loss(h_mu, h_log_var)
 
-                tqdm.write(f'recon loss {reconstruction_loss.item():.3f}, sparsity loss: {sparsity_loss.item():.3f}')
-
-                s_e_loss = reconstruction_loss + sparsity_loss
+                tqdm.write(
+                    f'recon loss {reconstruction_loss.item():.3f}, sparsity loss: {sparsity_loss.item():.3f}, prior loss: {prior_loss.item():.3f}')
+                s_e_loss = reconstruction_loss + sparsity_loss + prior_loss
 
                 self.s_e_optimizer.zero_grad()
                 s_e_loss.backward()
@@ -120,18 +123,20 @@ class Solver(object):
                     tqdm.write('Training dLSTM...')
 
                 # [seq_len, 1, hidden_size]
+                # [seq_len, 1, hidden_size]
                 original_features = self.linear_compress(image_features_.detach()).unsqueeze(1)
+                scores, h_mu, h_log_var, generated_features = self.summarizer(original_features)
+                _, _, _, uniform_features = self.summarizer(original_features, uniform=True)
 
-                scores, generated_features = self.summarizer(original_features)
-
+                ## Using the discriminator
                 h_origin, original_prob = self.discriminator(original_features)
-                h_sum, sum_prob = self.discriminator(generated_features)
+                h_fake, fake_prob = self.discriminator(generated_features)
+                h_uniform, uniform_prob = self.discriminator(uniform_features)
+                tqdm.write(
+                    f'orig_prob: {original_prob.item():.3f}, summ_prob: {fake_prob.item():.3f}, unif_prob: {uniform_prob.item():.3f}')
 
-                tqdm.write(f'original_p: {original_prob.item():.3f}, summary_p: {sum_prob.item():.3f}')
-
-                reconstruction_loss = self.reconstruction_loss(h_origin, h_sum)
-                g_loss = self.criterion(sum_prob, original_label)
-
+                reconstruction_loss = self.reconstruction_loss(h_fake, h_origin)
+                g_loss = self.gan_loss(original_prob, fake_prob, uniform_prob)
                 tqdm.write(f'recon loss {reconstruction_loss.item():.3f}, g loss: {g_loss.item():.3f}')
 
                 d_loss = reconstruction_loss + g_loss
@@ -148,30 +153,26 @@ class Solver(object):
                 if self.config.verbose:
                     tqdm.write('Training cLSTM...')
 
-                self.c_optimizer.zero_grad()
-
-                # Train with original loss
-                # [seq_len, 1, hidden_size]
                 original_features = self.linear_compress(image_features_.detach()).unsqueeze(1)
+                scores, h_mu, h_log_var, generated_features = self.summarizer(original_features)
+                _, _, _, uniform_features = self.summarizer(original_features, uniform=True)
+
+                ## Using the discriminator
                 h_origin, original_prob = self.discriminator(original_features)
-                c_original_loss = self.criterion(original_prob, original_label)
-                c_original_loss.backward()
+                h_fake, fake_prob = self.discriminator(generated_features)
+                h_uniform, uniform_prob = self.discriminator(uniform_features)
+                tqdm.write(
+                    f'orig_prob: {original_prob.item():.3f}, summ_prob: {fake_prob.item():.3f}, unif_prob: {uniform_prob.item():.3f}')
 
-                # Train with summary loss
-                scores, generated_features = self.summarizer(original_features)
-                h_sum, sum_prob = self.discriminator(generated_features.detach())
-                c_summary_loss = self.criterion(sum_prob, summary_label)
-                c_summary_loss.backward()
+                c_loss = -1 * self.gan_loss(original_prob, fake_prob, uniform_prob)
 
-                tqdm.write(f'original_p: {original_prob.item():.3f}, summary_p: {sum_prob.item():.3f}')
-                tqdm.write(f'gen loss: {g_loss.item():.3f}')
-
+                self.c_optimizer.zero_grad()
+                c_loss.backward()
                 # Gradient cliping
                 torch.nn.utils.clip_grad_norm(self.model.parameters(), self.config.clip)
                 self.c_optimizer.step()
 
-                c_original_loss_history.append(c_original_loss.data)
-                c_summary_loss_history.append(c_summary_loss.data)
+                c_loss_history.append(c_loss.data)
 
                 if self.config.verbose:
                     tqdm.write('Plotting...')
@@ -179,16 +180,18 @@ class Solver(object):
                 self.writer.update_loss(reconstruction_loss.data, step, 'recon_loss')
                 self.writer.update_loss(sparsity_loss.data, step, 'sparsity_loss')
                 self.writer.update_loss(g_loss.data, step, 'gen_loss')
+                self.writer.update_loss(prior_loss.data, step, 'prior_loss')
+                self.writer.update_loss(c_loss.data, step, 'c_loss')
 
                 self.writer.update_loss(original_prob.data, step, 'original_prob')
-                self.writer.update_loss(sum_prob.data, step, 'sum_prob')
+                self.writer.update_loss(uniform_prob.data, step, 'uniform_prob')
+                self.writer.update_loss(fake_prob.data, step, 'fake_prob')
 
                 step += 1
 
             s_e_loss = torch.stack(s_e_loss_history).mean()
             d_loss = torch.stack(d_loss_history).mean()
-            c_original_loss = torch.stack(c_original_loss_history).mean()
-            c_summary_loss = torch.stack(c_summary_loss_history).mean()
+            c_loss = torch.stack(c_original_loss_history).mean()
 
             # Plot
             if self.config.verbose:
@@ -235,7 +238,6 @@ class Solver(object):
                 tqdm.write(f'Saving score at {str(score_save_path)}.')
                 json.dump(out_dict, f)
             score_save_path.chmod(0o777)
-
 
 if __name__ == '__main__':
     pass

@@ -47,16 +47,12 @@ class Discriminator(nn.Module):
             prob: [batch_size=1, 1]
                 Probability to be original feature from CNN
         """
-
+        ## Put in the generated or actual video features => seq_len, 1, feature_size
         # [1, hidden_size]
         h = self.cLSTM(features)
-
-        # [1]
         prob = self.out(h).squeeze()
-
         return h, prob
 
 
 if __name__ == '__main__':
-
     pass

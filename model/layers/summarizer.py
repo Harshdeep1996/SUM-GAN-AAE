@@ -9,9 +9,14 @@ from layers.lstmcell import StackedLSTMCell
 class sLSTM(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers=2):
         """Scoring LSTM"""
+        ## Takes in a set of features for the frames and return
+        ## the scores for each of the frames
         super().__init__()
 
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, bidirectional=True)
+        self.lstm = nn.LSTM(
+            input_size, hidden_size, num_layers, bidirectional=True)
+        ## Getting a scalar score out for the hidden size and pass 
+        ## through sigmoid to get the probability
         self.out = nn.Sequential(
             nn.Linear(hidden_size * 2, 1),  # bidirection => scalar
             nn.Sigmoid())
@@ -23,14 +28,12 @@ class sLSTM(nn.Module):
         Return:
             scores: [seq_len, 1]
         """
+        ## Flatten the parameters to put them in a contiguous block
         self.lstm.flatten_parameters()
-
         # [seq_len, 1, hidden_size * 2]
         features, (h_n, c_n) = self.lstm(features)
-
         # [seq_len, 1]
         scores = self.out(features.squeeze(1))
-
         return scores
 
 
@@ -40,6 +43,8 @@ class eLSTM(nn.Module):
         super().__init__()
 
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers)
+        self.mu = nn.Linear(hidden_size, hidden_size)
+        self.log_var = nn.Linear(hidden_size, hidden_size)
 
     def forward(self, frame_features):
         """
@@ -57,51 +62,14 @@ class eLSTM(nn.Module):
         return output, (h_last, c_last)
 
 
-class Attn(nn.Module):
-    """Luong attention layer"""
-    def __init__(self, hidden_size, n_layers):
-        super(Attn, self).__init__()
-        self.hidden_size = hidden_size
-        self.attn = torch.nn.Linear(self.hidden_size*n_layers, hidden_size)	
-
-    def Mult_score(self, prev_hidden, encoder_output):
-        """
-        Args:
-            prev_hidden: [num_layers, batch_size=1, hidden_size]
-            encoder_output: [seq_len=1, batch_size, hidden_size]
-        Return:
-            [seq_len, batch_size=1]
-        """
-        prev_hidden = prev_hidden.transpose(0,1)					# [batch_size=1, num_layers, hidden_size]
-        prev_hidden = prev_hidden.reshape(prev_hidden.shape[0], -1) # [batch_size=1, num_layers*hidden_size]
-        energy = self.attn(prev_hidden)								# [batch_size=1, hidden_size]
-        energy = energy.unsqueeze(0) 								# [1, batch_size=1, hidden_size]
-        return torch.sum(encoder_output * energy, dim=2)
-
-    def forward(self, prev_hidden, encoder_output):
-        """
-        Args:
-            prev_hidden: [num_layers, batch_size=1, hidden_size]
-            encoder_output: [seq_len=1, batch_size, hidden_size]
-        Return:
-            [batch_size=1, 1, seq_len]
-        """
-        # Calculate the attention weights (energies)
-        attn_energies = self.Mult_score(prev_hidden, encoder_output)
-
-        # Transpose max_length and batch_size dimensions
-        attn_energies = attn_energies.t()	# [batch_size=1, seq_len]
-
-        # Return the softmax normalized probability scores (with added dimension)
-        return F.softmax(attn_energies, dim=1).unsqueeze(1)
-
 class dLSTM(nn.Module):
     def __init__(self, input_size=2048, hidden_size=2048, num_layers=2):
         """Decoder LSTM"""
         super().__init__()
 
-        self.attn = Attn(hidden_size, num_layers)
-        self.lstm_cell = StackedLSTMCell(num_layers, 2 * input_size, hidden_size)
+        ## TODO: should this be num_layers, input_size, hidden_size
+        self.lstm_cell = StackedLSTMCell(
+            num_layers, 2 * input_size, hidden_size)
         self.out = nn.Linear(hidden_size, input_size)
 
     def forward(self, seq_len, encoder_output, init_hidden):
@@ -115,7 +83,6 @@ class dLSTM(nn.Module):
         Return:
             out_features: [seq_len, 1, hidden_size]
         """
-
         batch_size = init_hidden[0].size(1)
         hidden_size = init_hidden[0].size(2)
 
@@ -128,28 +95,25 @@ class dLSTM(nn.Module):
             # last_c: [1, hidden_size] (c from last layer)
             # h: [num_layers=2, 1, hidden_size] (h from all layers)
             # c: [num_layers=2, 1, hidden_size] (c from all layers)
-
-            # Calculate attention weights from the previous decoder hidden states
-            attn_weights = self.attn(h, encoder_output)  # [1, 1, seq_len]
-            # Multiply attention weights to encoder outputs to get new "weighted sum" context vector
-            context = attn_weights.bmm(encoder_output.transpose(0, 1))  # [1, 1, hidden_size]
-
-            input_step = input_step.unsqueeze(0)  # [1, 1, hidden_size]
-            rnn_input = torch.cat([input_step, context], dim=2)  # [1, 1, 2*hidden_size]
-            rnn_input = rnn_input.squeeze(1)
-
-            (last_h, last_c), (h, c) = self.lstm_cell(rnn_input, (h, c))
+            (last_h, last_c), (h, c) = self.lstm_cell(input_step, (h, c))
             input_step = self.out(last_h)
             out_features.append(last_h)
         # list of seq_len '[1, hidden_size]-sized Variables'
         return out_features
 
 
-class AE(nn.Module):  
+class VAE(nn.Module):  
     def __init__(self, input_size, hidden_size, num_layers=2):
         super().__init__()
         self.e_lstm = eLSTM(input_size, hidden_size, num_layers)
         self.d_lstm = dLSTM(input_size, hidden_size, num_layers)
+        self.softplus = nn.Softplus()
+
+    def reparametrize(self, mu, log_var):
+        std = torch.exp(0.5 * log_var)
+        eps = Variable(torch.randn(std.size())).cuda()
+        sample = mu + (eps * std)
+        return sample.unsqueeze(1)
 
     def forward(self, features):
         """
@@ -163,24 +127,26 @@ class AE(nn.Module):
         # encoder_output: [seq_len, 1, hidden_size]
         # h and c: [num_layers, 1, hidden_size]
         encoder_output, (h, c) = self.e_lstm(features)
+        h = h.squeeze(1)
+        h_mu = self.e_lstm.mu(h)
+        h_log_variance = torch.log(self.softplus(self.e_lstm.log_var(h)))
+        h = self.reparametrize(h_mu, h_log_variance)
 
         # [seq_len, 1, hidden_size]
+        ## Get reparametrized hidden state, memory state 'c' remains the same
         decoded_features = self.d_lstm(seq_len, encoder_output, init_hidden=(h, c))
-
-        # [seq_len, 1, hidden_size]
-        # reverse
-        decoded_features.reverse()
+        decoded_features.reverse() ## reverse the sequence
         decoded_features = torch.stack(decoded_features)
-        return decoded_features
+        return h_mu, h_log_variance, decoded_features
 
 
 class Summarizer(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers=2):
         super().__init__()
         self.s_lstm = sLSTM(input_size, hidden_size, num_layers)
-        self.auto_enc = AE(input_size, hidden_size, num_layers)
+        self.auto_enc = VAE(input_size, hidden_size, num_layers)
 
-    def forward(self, image_features):
+    def forward(self, image_features, uniform=False):
         """
         Args:
             image_features: [seq_len, 1, hidden_size]
@@ -191,16 +157,18 @@ class Summarizer(nn.Module):
 
         # Apply weights
         # [seq_len, 1]
-        scores = self.s_lstm(image_features)
+        scores = weighted_features = None
+        if not uniform:
+            scores = self.s_lstm(image_features)
+        else:
+            scores = torch.Tensor(image_features.size(0)).uniform_(0, 1).cuda()
 
-        # [seq_len, 1, hidden_size]
-        weighted_features = image_features * scores.view(-1, 1, 1)
-
-        decoded_features = self.auto_enc(weighted_features)
-
-        return scores, decoded_features
+        ## Multiplying by columns since you are weighted the features
+        ## for each sequence
+        weighted_features = images_features * scores.view(-1,1,1)
+        h_mu, h_log_var, decoded_features = self.auto_enc(weighted_features)
+        return scores, h_mu, h_log_var, decoded_features
 
 
 if __name__ == '__main__':
-
     pass
